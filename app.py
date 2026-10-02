@@ -107,7 +107,10 @@ def thumb(thumbs, w=544):
 
 def clean_track(t):
     artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []))
-    album = (t.get("album") or {}).get("name", "")
+    alb = t.get("album")
+    # album is a dict {"name","id"} in search/playlist results,
+    # but a plain string in get_album track lists
+    album = alb.get("name", "") if isinstance(alb, dict) else (alb or "")
     return {
         "videoId": t.get("videoId"),
         "title": t.get("title"),
