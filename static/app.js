@@ -3,12 +3,34 @@ const $ = id => document.getElementById(id);
 const audio = $('audio');
 const view = $('view');
 
+/* PWA: installable app shell + offline shell cache */
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}
+
 const S = {
   tab: 'home', queue: [], idx: 0, shuffle: false, repeat: 'off',
   lyricsBrowseId: null, currentId: null, order: [], disliked: false,
   likes: JSON.parse(localStorage.getItem('mm_likes') || '[]'),
+  history: JSON.parse(localStorage.getItem('sur_history') || '[]'),
 };
 function saveLikes() { localStorage.setItem('mm_likes', JSON.stringify(S.likes)); }
+function saveHistory() {
+  try { localStorage.setItem('sur_history', JSON.stringify(S.history.slice(0, 60))); }
+  catch (e) {}
+}
+function pushHistory(t) {
+  if (!t || !t.videoId) return;
+  S.history = S.history.filter(x => x.videoId !== t.videoId);
+  S.history.unshift({
+    videoId: t.videoId, title: t.title, artists: t.artists,
+    thumbnail: art(t), duration: t.duration,
+  });
+  S.history = S.history.slice(0, 60);
+  saveHistory();
+}
 
 /* ---------- helpers ---------- */
 function ic(n, cls) {
@@ -147,10 +169,17 @@ function showLibrary() {
     html += '<button class="pill solid" id="libPlay" style="max-width:220px;margin-bottom:10px">' + ic('play', 'sm') + ' Play all</button>';
     html += S.likes.map(t => rowHtml(t)).join('');
   }
+  if (S.history.length) {
+    html += '<div class="sec-head"><div class="sec-title">Recently played</div>' +
+      '<button class="chip" id="clearHist" style="padding:6px 12px">Clear</button></div>';
+    html += '<div id="histRows">' + S.history.map(t => rowHtml(t)).join('') + '</div>';
+  }
   view.innerHTML = html;
-  view._ctxTracks = S.likes;
+  view._ctxTracks = S.likes.concat(S.history);
   const lp = $('libPlay');
   if (lp) lp.onclick = () => playTrack(S.likes[0].videoId, S.likes, 0);
+  const ch = $('clearHist');
+  if (ch) ch.onclick = (e) => { e.stopPropagation(); S.history = []; saveHistory(); showLibrary(); };
   bindAll();
 }
 
@@ -304,6 +333,7 @@ function setMiniVisible(v) { $('mini').classList.toggle('show', v); }
 
 async function playTrack(videoId, queue, startIdx) {
   S.currentId = videoId; S.disliked = false; S.lyricsBrowseId = null;
+  audio._retried = false;
   setMiniVisible(true);
   $('mTitle').textContent = 'Loading...'; $('mArtist').textContent = '';
   $('pTitle').textContent = 'Loading...'; $('pArtist').textContent = '';
@@ -320,12 +350,9 @@ async function playTrack(videoId, queue, startIdx) {
     $('mArtist').textContent = artistName; $('pArtist').textContent = artistName;
     $('mArt').src = meta.thumbnail; $('pArt').src = meta.thumbnail;
     updateRateUI();
-    if ('mediaSession' in navigator) {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: meta.title || 'Unknown', artist: artistName,
-        artwork: [{ src: meta.thumbnail, sizes: '512x512', type: 'image/jpeg' }],
-      });
-    }
+    pushHistory({ videoId, title: meta.title || 'Unknown', artists: artistName,
+                  thumbnail: meta.thumbnail, duration: qt ? qt.duration : null });
+    setMediaSession(meta.title || 'Unknown', artistName, meta.thumbnail);
     loadQueue(videoId, queue, startIdx);
     if (!$('lyricsBox').classList.contains('hidden')) loadLyrics();  // refresh open lyrics tab
   } catch (e) {
@@ -463,23 +490,92 @@ async function loadLyrics() {
   } catch (e) { box.innerHTML = '<div class="err">Could not load lyrics.</div>'; }
 }
 
+/* ---------- background playback: full MediaSession integration ----------
+   This is what keeps music playing with the screen off / app in background
+   and powers the lock-screen + notification + Bluetooth controls. */
+function setMediaSession(title, artist, artwork) {
+  if (!('mediaSession' in navigator)) return;
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: title || 'Unknown',
+      artist: artist || 'Unknown artist',
+      album: 'Sur',
+      artwork: artwork ? [
+        { src: artwork, sizes: '96x96', type: 'image/jpeg' },
+        { src: artwork, sizes: '512x512', type: 'image/jpeg' },
+      ] : [],
+    });
+    updatePositionState();
+  } catch (e) {}
+}
+function updatePositionState() {
+  if (!('mediaSession' in navigator) || !('setPositionState' in navigator.mediaSession)) return;
+  try {
+    if (audio.duration && isFinite(audio.duration) && audio.duration > 0) {
+      navigator.mediaSession.setPositionState({
+        duration: audio.duration,
+        playbackRate: audio.playbackRate || 1,
+        position: Math.min(audio.currentTime || 0, audio.duration),
+      });
+    }
+  } catch (e) {}
+}
+function setPlaybackState(playing) {
+  if (!('mediaSession' in navigator)) return;
+  try { navigator.mediaSession.playbackState = playing ? 'playing' : 'paused'; } catch (e) {}
+}
+function initMediaSessionHandlers() {
+  if (!('mediaSession' in navigator)) return;
+  const H = (name, fn) => { try { navigator.mediaSession.setActionHandler(name, fn); } catch (e) {} };
+  H('play', () => audio.play());
+  H('pause', () => audio.pause());
+  H('previoustrack', prev);
+  H('nexttrack', () => next(false));
+  H('seekbackward', (d) => { audio.currentTime = Math.max(0, (audio.currentTime || 0) - (d.seekOffset || 10)); updatePositionState(); });
+  H('seekforward', (d) => { audio.currentTime = Math.min(audio.duration || 0, (audio.currentTime || 0) + (d.seekOffset || 10)); updatePositionState(); });
+  H('seekto', (d) => {
+    if (d.fastSeek && 'fastSeek' in audio) { try { audio.fastSeek(d.seekTime); } catch (e) { audio.currentTime = d.seekTime; } }
+    else audio.currentTime = d.seekTime;
+    updatePositionState();
+  });
+}
+initMediaSessionHandlers();
+
 /* ---------- player events ---------- */
+let lastPosUpdate = 0;
 audio.addEventListener('timeupdate', () => {
   if (audio.duration) {
     $('seek').value = Math.floor(audio.currentTime / audio.duration * 1000);
     $('mProg').style.width = (audio.currentTime / audio.duration * 100) + '%';
   }
   $('tCur').textContent = fmt(audio.currentTime);
+  const now = Date.now();
+  if (now - lastPosUpdate > 4000) { lastPosUpdate = now; updatePositionState(); }
   syncActiveLine();
 });
-audio.addEventListener('loadedmetadata', () => { $('tDur').textContent = fmt(audio.duration); });
+audio.addEventListener('loadedmetadata', () => { $('tDur').textContent = fmt(audio.duration); updatePositionState(); });
+audio.addEventListener('seeked', updatePositionState);
 audio.addEventListener('ended', () => next(true));
+/* If a stream URL expired mid-play (403), re-resolve once and resume. */
+audio.addEventListener('error', () => {
+  if (!S.currentId || audio._retried) return;
+  audio._retried = true;
+  fetch('/api/song/' + S.currentId).then(r => r.json()).then(meta => {
+    if (meta.stream_url && S.currentId) {
+      const pos = audio.currentTime || 0;
+      audio.src = meta.stream_url;
+      audio.currentTime = pos;
+      audio.play().catch(() => {});
+    }
+  }).catch(() => {});
+  setTimeout(() => { audio._retried = false; }, 30000);
+});
 function setPlayIcons(playing) {
   $('mToggleIc').setAttribute('href', playing ? '#i-pause' : '#i-play');
   $('pToggleIc').setAttribute('href', playing ? '#i-pause' : '#i-play');
 }
-audio.addEventListener('play', () => setPlayIcons(true));
-audio.addEventListener('pause', () => setPlayIcons(false));
+audio.addEventListener('play', () => { setPlayIcons(true); setPlaybackState(true); });
+audio.addEventListener('pause', () => { setPlayIcons(false); setPlaybackState(false); });
 $('seek').addEventListener('input', e => {
   if (audio.duration) audio.currentTime = e.target.value / 1000 * audio.duration;
 });
@@ -514,14 +610,6 @@ function showPTab(which) {
 }
 $('tabQueue').onclick = () => showPTab('queue');
 $('tabLyrics').onclick = () => showPTab('lyrics');
-if ('mediaSession' in navigator) {
-  try {
-    navigator.mediaSession.setActionHandler('play', () => audio.play());
-    navigator.mediaSession.setActionHandler('pause', () => audio.pause());
-    navigator.mediaSession.setActionHandler('previoustrack', prev);
-    navigator.mediaSession.setActionHandler('nexttrack', () => next(false));
-  } catch (e) {}
-}
 
 /* ---------- top-level nav ---------- */
 document.querySelectorAll('.navbtn').forEach(b => b.onclick = () => setTab(b.dataset.tab));
