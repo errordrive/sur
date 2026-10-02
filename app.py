@@ -160,32 +160,53 @@ def resolve_stream(video_id):
 
 # ------------------------------------------- Invidious fallback resolvers
 # Public Invidious instances proxy YouTube audio when this host's own IP is
-# bot-walled by YouTube. /latest_version?itag=140 = m4a audio. Each candidate
-# is probed (ranged GET, must return audio bytes) before use.
-_INVIDIOUS_INSTANCES = [
+# bot-walled by YouTube. /latest_version?itag=140 = m4a audio. The candidate
+# list is discovered live from api.invidious.io (public instances die often,
+# so hardcoding alone rots); each candidate is probed with the real video
+# (ranged GET must return audio bytes) before use, and the list is cached
+# per worker process.
+_INVIDIOUS_SEED = [
     "https://invidious.nerdvpn.de",
     "https://invidious.tiekoetter.com",
 ]
+_inv_candidates = None
+_inv_lock = threading.Lock()
+
+
+def _invidious_candidates():
+    global _inv_candidates
+    with _inv_lock:
+        if _inv_candidates is not None:
+            return _inv_candidates
+        cands = list(_INVIDIOUS_SEED)
+        try:
+            r = requests.get("https://api.invidious.io/instances.json", timeout=20)
+            for domain, meta in r.json():
+                if (isinstance(domain, str) and domain
+                        and ".onion" not in domain and "i2p" not in domain.lower()):
+                    u = "https://" + domain
+                    if u not in cands:
+                        cands.append(u)
+        except Exception:
+            pass
+        _inv_candidates = cands
+        return cands
 
 
 def _try_invidious(video_id):
-    for base in _INVIDIOUS_INSTANCES:
+    for base in _invidious_candidates():
         url = f"{base}/latest_version?id={video_id}&itag=140"
-        for verify in (True, False):  # False = strict/MITM networks retry
-            try:
-                r = requests.get(
-                    url,
-                    headers={"Range": "bytes=0-1023", "User-Agent": "Sur/1.0"},
-                    timeout=20, allow_redirects=True, verify=verify,
-                )
-                ct = r.headers.get("Content-Type", "")
-                if r.status_code in (200, 206) and len(r.content) > 500 and "audio" in ct:
-                    return url
-                break  # reachable but no audio -> try next instance
-            except Exception as e:
-                if ("certificate" in str(e).lower() or "ssl" in str(e).lower()) and verify:
-                    continue  # retry once without verification
-                break
+        try:
+            r = requests.get(
+                url,
+                headers={"Range": "bytes=0-1023", "User-Agent": "Sur/1.0"},
+                timeout=12, allow_redirects=True,
+            )
+            ct = r.headers.get("Content-Type", "")
+            if r.status_code in (200, 206) and len(r.content) > 500 and "audio" in ct:
+                return url
+        except Exception:
+            continue
     return None
 
 
