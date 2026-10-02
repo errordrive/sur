@@ -43,8 +43,18 @@ def _rate_limited(ip):
         return False
 
 
-# Tried in order — different IPs/networks get bot-checked on different clients.
-_PLAYER_CLIENTS = ["ios", "android", "web", "tv"]
+# Tried in order — different IPs/networks get bot-checked on different clients:
+# web_embedded (embed player path) is historically the least bot-guarded,
+# then the mobile/TV clients, then plain web.
+_PLAYER_CLIENTS = ["web_embedded", "android", "ios", "tv", "web", "mweb"]
+
+# curl_cffi lets yt-dlp impersonate Chrome's TLS fingerprint, which helps
+# against YouTube's bot wall on datacenter IPs. Optional: used only if installed.
+try:
+    import curl_cffi  # noqa: F401
+    _IMPERSONATE = "chrome"
+except ImportError:
+    _IMPERSONATE = None
 
 
 def _ensure_cookies():
@@ -87,6 +97,8 @@ def _ydl_opts(client, no_verify=False):
     }
     if _COOKIEFILE:
         opts["cookiefile"] = _COOKIEFILE
+    if _IMPERSONATE:
+        opts["impersonate"] = _IMPERSONATE
     return opts
 
 
@@ -151,17 +163,21 @@ _INVIDIOUS_INSTANCES = [
 def _try_invidious(video_id):
     for base in _INVIDIOUS_INSTANCES:
         url = f"{base}/latest_version?id={video_id}&itag=140"
-        try:
-            r = requests.get(
-                url,
-                headers={"Range": "bytes=0-1023", "User-Agent": "Sur/1.0"},
-                timeout=20, allow_redirects=True,
-            )
-            ct = r.headers.get("Content-Type", "")
-            if r.status_code in (200, 206) and len(r.content) > 500 and "audio" in ct:
-                return url
-        except Exception:
-            continue
+        for verify in (True, False):  # False = strict/MITM networks retry
+            try:
+                r = requests.get(
+                    url,
+                    headers={"Range": "bytes=0-1023", "User-Agent": "Sur/1.0"},
+                    timeout=20, allow_redirects=True, verify=verify,
+                )
+                ct = r.headers.get("Content-Type", "")
+                if r.status_code in (200, 206) and len(r.content) > 500 and "audio" in ct:
+                    return url
+                break  # reachable but no audio -> try next instance
+            except Exception as e:
+                if ("certificate" in str(e).lower() or "ssl" in str(e).lower()) and verify:
+                    continue  # retry once without verification
+                break
     return None
 
 
