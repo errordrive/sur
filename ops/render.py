@@ -51,10 +51,12 @@ def cmd_create_service(owner_id, repo_url):
         "autoDeployTrigger": "commit",
         "serviceDetails": {
             "runtime": "python",
-            "buildCommand": "pip install -r requirements.txt",
-            "startCommand": "gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120",
             "plan": "free",
             "healthCheckPath": "/api/health",
+            "envSpecificDetails": {
+                "buildCommand": "pip install -r requirements.txt",
+                "startCommand": "gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120",
+            },
         },
         "envVars": [{"key": "PYTHON_VERSION", "value": "3.11.9"}],
     }
