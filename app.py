@@ -50,12 +50,18 @@ def _rate_limited(ip):
 _PLAYER_CLIENTS = ["web_embedded", "android", "ios", "tv", "web", "mweb"]
 
 # curl_cffi lets yt-dlp impersonate Chrome's TLS fingerprint, which helps
-# against YouTube's bot wall on datacenter IPs. Optional: used only if installed.
-try:
-    import curl_cffi  # noqa: F401
-    _IMPERSONATE = "chrome"
-except ImportError:
-    _IMPERSONATE = None
+# against YouTube's bot wall on datacenter IPs. Enabled only if yt-dlp itself
+# confirms the target works (import success alone is not enough).
+def _detect_impersonate():
+    try:
+        import curl_cffi  # noqa: F401
+        with YoutubeDL({"impersonate": "chrome", "quiet": True, "skip_download": True}):
+            return "chrome"
+    except Exception:
+        return None
+
+
+_IMPERSONATE = _detect_impersonate()
 
 
 def _ensure_cookies():
