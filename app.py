@@ -106,6 +106,13 @@ def _ydl_opts(client, no_verify=False):
         opts["cookiefile"] = _COOKIEFILE
     if _IMPERSONATE:
         opts["impersonate"] = _IMPERSONATE
+    # Optional forward proxy for yt-dlp (e.g. your own VPS when the host IP
+    # is bot-blocked by YouTube). Set YTDLP_PROXY=http://user:pass@host:port
+    # in the environment. Only the lightweight player-API calls go through
+    # the proxy; the audio itself streams straight to the listener's browser.
+    proxy = os.environ.get("YTDLP_PROXY", "").strip()
+    if proxy:
+        opts["proxy"] = proxy
     return opts
 
 
