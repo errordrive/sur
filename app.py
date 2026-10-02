@@ -43,15 +43,36 @@ def _rate_limited(ip):
         return False
 
 
-def _ydl_opts(no_verify=False):
+# Tried in order — different IPs/networks get bot-checked on different clients.
+_PLAYER_CLIENTS = ["ios", "android", "web", "tv"]
+
+
+def _ydl_opts(client, no_verify=False):
     return {
         "quiet": True,
         "no_warnings": True,
         "format": "bestaudio/best",
         "skip_download": True,
         "nocheckcertificate": no_verify,
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
+        "extractor_args": {"youtube": {"player_client": [client]}},
     }
+
+
+def _try_resolve(url, client, now):
+    try:
+        with YoutubeDL(_ydl_opts(client)) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        # sandbox/strict networks: retry without cert verification
+        if "certificate" in str(e).lower() or "ssl" in str(e).lower():
+            with YoutubeDL(_ydl_opts(client, no_verify=True)) as ydl:
+                info = ydl.extract_info(url, download=False)
+        else:
+            raise
+    stream_url = info.get("url")
+    if not stream_url:
+        raise DownloadError("no playable URL found")
+    return stream_url, info.get("title")
 
 
 def resolve_stream(video_id):
@@ -62,24 +83,17 @@ def resolve_stream(video_id):
         if hit and now - hit[2] < CACHE_TTL:
             return hit[0], hit[1]
     url = f"https://music.youtube.com/watch?v={video_id}"
-    info = None
-    try:
-        with YoutubeDL(_ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        # sandbox/strict networks: retry without cert verification
-        if "certificate" in str(e).lower() or "ssl" in str(e).lower():
-            with YoutubeDL(_ydl_opts(no_verify=True)) as ydl:
-                info = ydl.extract_info(url, download=False)
-        else:
-            raise
-    stream_url = info.get("url")
-    title = info.get("title")
-    if not stream_url:
-        raise DownloadError("no playable URL found")
-    with _cache_lock:
-        _stream_cache[video_id] = (stream_url, title, now)
-    return stream_url, title
+    last_err = None
+    for client in _PLAYER_CLIENTS:
+        try:
+            stream_url, title = _try_resolve(url, client, now)
+            with _cache_lock:
+                _stream_cache[video_id] = (stream_url, title, now)
+            return stream_url, title
+        except Exception as e:
+            last_err = e
+            continue
+    raise DownloadError(f"all player clients failed (last: {last_err})")
 
 
 # ------------------------------------------------------------------ helpers
