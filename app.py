@@ -47,8 +47,37 @@ def _rate_limited(ip):
 _PLAYER_CLIENTS = ["ios", "android", "web", "tv"]
 
 
+def _ensure_cookies():
+    """Make YouTube cookies available to yt-dlp (defeats the 'not a bot' block).
+
+    Two ways (first wins):
+    1. YTDLP_COOKIES_CONTENT env var = full cookies.txt content
+       (paste in Render dashboard -> Environment; never commit it).
+    2. YTDLP_COOKIES env var = path to a cookies.txt file.
+    Returns the file path or None.
+    """
+    content = os.environ.get("YTDLP_COOKIES_CONTENT", "")
+    if content.strip():
+        if "\\n" in content and "\n" not in content:
+            content = content.replace("\\n", "\n")
+        p = "/tmp/yt-cookies.txt"
+        try:
+            with open(p, "w") as f:
+                f.write(content)
+            return p
+        except Exception:
+            return None
+    path = os.environ.get("YTDLP_COOKIES", "")
+    if path and os.path.exists(path):
+        return path
+    return None
+
+
+_COOKIEFILE = _ensure_cookies()
+
+
 def _ydl_opts(client, no_verify=False):
-    return {
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "format": "bestaudio/best",
@@ -56,6 +85,9 @@ def _ydl_opts(client, no_verify=False):
         "nocheckcertificate": no_verify,
         "extractor_args": {"youtube": {"player_client": [client]}},
     }
+    if _COOKIEFILE:
+        opts["cookiefile"] = _COOKIEFILE
+    return opts
 
 
 def _try_resolve(url, client, now):
@@ -76,7 +108,11 @@ def _try_resolve(url, client, now):
 
 
 def resolve_stream(video_id):
-    """Return a directly-playable audio URL for a videoId (cached)."""
+    """Return a directly-playable audio URL for a videoId (cached).
+
+    Chain: yt-dlp (direct googlevideo URLs) -> Invidious proxies
+    (for hosts whose IP YouTube bot-walls, e.g. some datacenter IPs).
+    """
     now = time.time()
     with _cache_lock:
         hit = _stream_cache.get(video_id)
@@ -93,7 +129,40 @@ def resolve_stream(video_id):
         except Exception as e:
             last_err = e
             continue
-    raise DownloadError(f"all player clients failed (last: {last_err})")
+    # yt-dlp is bot-walled from this host -> fall back to Invidious proxies
+    inv = _try_invidious(video_id)
+    if inv:
+        with _cache_lock:
+            _stream_cache[video_id] = (inv, None, now)
+        return inv, None
+    raise DownloadError(f"all resolvers failed (last: {last_err})")
+
+
+# ------------------------------------------- Invidious fallback resolvers
+# Public Invidious instances proxy YouTube audio when this host's own IP is
+# bot-walled by YouTube. /latest_version?itag=140 = m4a audio. Each candidate
+# is probed (ranged GET, must return audio bytes) before use.
+_INVIDIOUS_INSTANCES = [
+    "https://invidious.nerdvpn.de",
+    "https://invidious.tiekoetter.com",
+]
+
+
+def _try_invidious(video_id):
+    for base in _INVIDIOUS_INSTANCES:
+        url = f"{base}/latest_version?id={video_id}&itag=140"
+        try:
+            r = requests.get(
+                url,
+                headers={"Range": "bytes=0-1023", "User-Agent": "Sur/1.0"},
+                timeout=20, allow_redirects=True,
+            )
+            ct = r.headers.get("Content-Type", "")
+            if r.status_code in (200, 206) and len(r.content) > 500 and "audio" in ct:
+                return url
+        except Exception:
+            continue
+    return None
 
 
 # ------------------------------------------------------------------ helpers
