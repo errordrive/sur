@@ -5,6 +5,7 @@ Audio stream URLs resolved with yt-dlp (android client) because
 ytmusicapi returns signatureCipher'd URLs that browsers can't play directly.
 """
 import os
+import re
 import time
 import threading
 import traceback
@@ -492,6 +493,47 @@ def api_artist(channel_id):
 @app.get("/api/health")
 def api_health():
     return jsonify({"ok": True})
+
+
+# --------------------------------------------- YouTube player JS (client-side decipher)
+# The listener's browser has a clean (non-blocked) IP, so stream-URL
+# deciphering can happen client-side: the server fetches YouTube's player JS
+# (a static file) once, and the browser extracts the signature-decipher
+# function from it to turn signatureCipher into a playable URL itself.
+# No proxy, no cookies, no account needed.
+_player_js = {"url": None, "code": None, "fetched_at": 0}
+_player_js_lock = threading.Lock()
+PLAYER_JS_TTL = 3600
+
+
+def _fetch_player_js(video_id="jZGyxQOQcd0"):
+    now = time.time()
+    with _player_js_lock:
+        if _player_js["code"] and now - _player_js["fetched_at"] < PLAYER_JS_TTL:
+            return _player_js["url"], _player_js["code"]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+    embed = requests.get(f"https://www.youtube.com/embed/{video_id}",
+                         headers=headers, timeout=25).text
+    m = re.search(r'"jsUrl":"(/s/player/[^"]+/base\.js)"', embed)
+    if not m:
+        raise RuntimeError("jsUrl not found in embed page")
+    js_url = "https://www.youtube.com" + m.group(1)
+    code = requests.get(js_url, headers=headers, timeout=30).text
+    if len(code) < 100000:
+        raise RuntimeError(f"player JS too small: {len(code)}")
+    with _player_js_lock:
+        _player_js.update(url=js_url, code=code, fetched_at=now)
+    return js_url, code
+
+
+@app.get("/api/player-js")
+def api_player_js():
+    """Probe/serve YouTube's player JS (needed for client-side decipher)."""
+    try:
+        js_url, code = _fetch_player_js()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 502
+    return jsonify({"ok": True, "js_url": js_url, "size_bytes": len(code)})
 
 
 if __name__ == "__main__":
