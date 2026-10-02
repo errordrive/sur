@@ -7,6 +7,7 @@ ytmusicapi returns signatureCipher'd URLs that browsers can't play directly.
 import os
 import time
 import threading
+import traceback
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -139,7 +140,8 @@ def resolve_stream(video_id):
                 _stream_cache[video_id] = (stream_url, title, now)
             return stream_url, title
         except Exception as e:
-            errs.append(f"{client}: {str(e)[:160]}")
+            tb = traceback.format_exc(limit=5).replace("\n", " | ")[:800]
+            errs.append(f"{client}: {type(e).__name__}: {str(e)[:160]} || TB: {tb}")
             continue
     # yt-dlp is bot-walled from this host -> fall back to Invidious proxies
     inv = _try_invidious(video_id)
