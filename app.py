@@ -131,7 +131,7 @@ def resolve_stream(video_id):
         if hit and now - hit[2] < CACHE_TTL:
             return hit[0], hit[1]
     url = f"https://music.youtube.com/watch?v={video_id}"
-    last_err = None
+    errs = []
     for client in _PLAYER_CLIENTS:
         try:
             stream_url, title = _try_resolve(url, client, now)
@@ -139,7 +139,7 @@ def resolve_stream(video_id):
                 _stream_cache[video_id] = (stream_url, title, now)
             return stream_url, title
         except Exception as e:
-            last_err = e
+            errs.append(f"{client}: {str(e)[:160]}")
             continue
     # yt-dlp is bot-walled from this host -> fall back to Invidious proxies
     inv = _try_invidious(video_id)
@@ -147,7 +147,7 @@ def resolve_stream(video_id):
         with _cache_lock:
             _stream_cache[video_id] = (inv, None, now)
         return inv, None
-    raise DownloadError(f"all resolvers failed (last: {last_err})")
+    raise DownloadError("all resolvers failed | " + " || ".join(errs))
 
 
 # ------------------------------------------- Invidious fallback resolvers
