@@ -137,8 +137,8 @@ def _try_resolve(url, client, now):
 def resolve_stream(video_id):
     """Return a directly-playable audio URL for a videoId (cached).
 
-    Chain: yt-dlp (direct googlevideo URLs) -> Invidious proxies
-    (for hosts whose IP YouTube bot-walls, e.g. some datacenter IPs).
+    Chain: cipher resolver (ytmusicapi cipher + yt-dlp decipher, no player
+    API, immune to IP bot-walls) -> yt-dlp direct clients -> Invidious.
     """
     now = time.time()
     with _cache_lock:
@@ -147,6 +147,14 @@ def resolve_stream(video_id):
             return hit[0], hit[1]
     url = f"https://music.youtube.com/watch?v={video_id}"
     errs = []
+    # 1) cipher path: works even when the host IP is bot-walled
+    try:
+        stream_url, title = _resolve_via_cipher(video_id)
+        with _cache_lock:
+            _stream_cache[video_id] = (stream_url, title, now)
+        return stream_url, title
+    except Exception as e:
+        errs.append(f"cipher: {type(e).__name__}: {str(e)[:160]}")
     for client in _PLAYER_CLIENTS:
         try:
             stream_url, title = _try_resolve(url, client, now)
@@ -534,6 +542,72 @@ def api_player_js():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:200]}), 502
     return jsonify({"ok": True, "js_url": js_url, "size_bytes": len(code)})
+
+
+# ------------------------------------------- cipher resolver (no player API)
+# YouTube bot-blocks this host's IP on youtubei/v1/player, but two things DO
+# work from here: ytmusicapi's streamingData (signatureCipher) and the player
+# JS (base.js, a static file). So we feed ytmusicapi's streamingData straight
+# into yt-dlp's own format extractor, which solves the sig/n challenges with
+# its stock, maintained machinery. No cookies / proxy / account needed.
+#
+# The challenge solver needs a JS runtime: Node is bundled at build time
+# (see render.yaml) into ./.node/.
+_NODE_BIN = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".node", "node-v22.18.0-linux-x64", "bin", "node")
+
+
+def _js_runtimes_cfg():
+    if os.path.isfile(_NODE_BIN) and os.access(_NODE_BIN, os.X_OK):
+        return {"node": {"path": _NODE_BIN}}
+    return {"node": {}}  # fall back to PATH lookup (local dev)
+def _resolve_via_cipher(video_id):
+    """Resolve a playable audio URL: ytmusicapi cipher + yt-dlp decipher."""
+    song = None
+    for attempt in range(4):
+        try:
+            song = yt.get_song(video_id)
+            sd = song.get("streamingData") or {}
+            if sd.get("adaptiveFormats") or sd.get("formats"):
+                break
+        except Exception:
+            pass
+        song = None
+        time.sleep(1 + attempt)  # backoff on transient empty responses
+    if not song:
+        raise DownloadError("no streamingData from ytmusicapi")
+    sd = song.get("streamingData") or {}
+    vd = song.get("videoDetails") or {}
+    # bookkeeping keys yt-dlp's _extract_player_responses normally sets.
+    # Label as web_embedded: its GVS PO-token policy doesn't require tokens
+    # (android/ios/web do now), so formats aren't skipped for missing POT.
+    sd["__yt_dlp_client"] = "web_embedded"
+    sd["__yt_dlp_fetch_gvs_po_token"] = lambda required=False: None
+    sd["__yt_dlp_player_token_provided"] = False
+    sd["__yt_dlp_innertube_context"] = None
+    sd["__yt_dlp_is_premium_subscriber"] = False
+    sd["__yt_dlp_available_at_timestamp"] = None
+    pr = {"streamingData": sd, "videoDetails": vd}
+    player_url, _code = _fetch_player_js(video_id)  # cached base.js
+    duration = int(vd.get("lengthSeconds") or 0) or None
+    with YoutubeDL({"quiet": True, "no_warnings": True,
+                    "nocheckcertificate": True,  # sandbox egress MITM; harmless for public JS
+                    "js_runtimes": _js_runtimes_cfg(),
+                    "remote_components": {"ejs:github"}}) as ydl:
+        ie = ydl.get_info_extractor("Youtube")
+        ie.initialize()  # sets up _jsc_director (sig/n challenge solver)
+        *formats, _subs = ie._extract_formats_and_subtitles(
+            video_id, [pr], player_url, None, duration)
+        # sort worst -> best by audio quality (mimics bestaudio)
+        formats.sort(key=lambda f: (f.get("abr") or 0, f.get("asr") or 0))
+    for f in reversed(formats):
+        if f.get("url") and f.get("vcodec") == "none" and f.get("acodec") != "none":
+            return f["url"], vd.get("title")
+    for f in reversed(formats):
+        if f.get("url") and f.get("acodec") != "none":
+            return f["url"], vd.get("title")
+    raise DownloadError("no playable format after decipher")
 
 
 if __name__ == "__main__":
