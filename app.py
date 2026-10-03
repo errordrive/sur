@@ -565,18 +565,36 @@ def _js_runtimes_cfg():
 def _resolve_via_cipher(video_id):
     """Resolve a playable audio URL: ytmusicapi cipher + yt-dlp decipher."""
     song = None
-    for attempt in range(4):
+    # streamingData must come from a clean IP. The Cloudflare relay
+    # (free, our own worker) retries internally until YouTube answers.
+    relay = os.environ.get("YT_RELAY", "https://ytprobe.nctti.tech/resolve")
+    for attempt in range(2):
         try:
-            song = yt.get_song(video_id)
-            sd = song.get("streamingData") or {}
-            if sd.get("adaptiveFormats") or sd.get("formats"):
-                break
+            r = requests.get(f"{relay}?v={video_id}", timeout=90)
+            if r.status_code == 200:
+                data = r.json()
+                sd = data.get("streamingData") or {}
+                if sd.get("adaptiveFormats") or sd.get("formats"):
+                    song = {"streamingData": sd,
+                            "videoDetails": data.get("videoDetails", {})}
+                    break
         except Exception:
             pass
-        song = None
-        time.sleep(1 + attempt)  # backoff on transient empty responses
+        time.sleep(2)
+    # fallback: direct ytmusicapi (works from non-blocked networks)
     if not song:
-        raise DownloadError("no streamingData from ytmusicapi")
+        for attempt in range(3):
+            try:
+                s = yt.get_song(video_id)
+                sd = s.get("streamingData") or {}
+                if sd.get("adaptiveFormats") or sd.get("formats"):
+                    song = s
+                    break
+            except Exception:
+                pass
+            time.sleep(1 + attempt)
+    if not song:
+        raise DownloadError("no streamingData (relay + ytmusicapi)")
     sd = song.get("streamingData") or {}
     vd = song.get("videoDetails") or {}
     # bookkeeping keys yt-dlp's _extract_player_responses normally sets.
