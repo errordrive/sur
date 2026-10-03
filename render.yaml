@@ -4,7 +4,12 @@ services:
     name: sur
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: >-
+      curl -fsSLO https://nodejs.org/dist/v22.18.0/node-v22.18.0-linux-x64.tar.xz &&
+      tar -xf node-v22.18.0-linux-x64.tar.xz &&
+      rm node-v22.18.0-linux-x64.tar.xz &&
+      mv node-v22.18.0-linux-x64 .node &&
+      pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
     healthCheckPath: /api/health
     envVars:
