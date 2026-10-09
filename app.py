@@ -134,43 +134,58 @@ def _try_resolve(url, client, now):
     return stream_url, info.get("title")
 
 
-def resolve_stream(video_id):
-    """Return a directly-playable audio URL for a videoId (cached).
+def resolve_stream(video_id, fresh=False):
+    """Return (playable audio URL, title, via) for a videoId (cached).
 
-    Chain: cipher resolver (ytmusicapi cipher + yt-dlp decipher, no player
-    API, immune to IP bot-walls) -> yt-dlp direct clients -> Invidious.
+    Chain depends on cookies: with YTDLP_COOKIES_CONTENT set, yt-dlp
+    defeats YouTube's datacenter bot-wall and is tried FIRST (fast).
+    Without cookies: cipher relay (quick attempt) -> yt-dlp (2 clients,
+    fail-fast) -> Invidious proxies. `via` names the winning resolver
+    for /api/diag and the client's diagnostics screen.
     """
     now = time.time()
-    with _cache_lock:
-        hit = _stream_cache.get(video_id)
-        if hit and now - hit[2] < CACHE_TTL:
-            return hit[0], hit[1]
+    if not fresh:
+        with _cache_lock:
+            hit = _stream_cache.get(video_id)
+            if hit and now - hit[2] < CACHE_TTL:
+                return hit[0], hit[1], hit[3] if len(hit) > 3 else "cache"
     url = f"https://music.youtube.com/watch?v={video_id}"
     errs = []
-    # 1) cipher path: works even when the host IP is bot-walled
-    try:
-        stream_url, title = _resolve_via_cipher(video_id)
+
+    def _ok(stream_url, title, via):
         with _cache_lock:
-            _stream_cache[video_id] = (stream_url, title, now)
-        return stream_url, title
-    except Exception as e:
-        errs.append(f"cipher: {type(e).__name__}: {str(e)[:160]}")
-    for client in _PLAYER_CLIENTS:
+            _stream_cache[video_id] = (stream_url, title, now, via)
+        return stream_url, title, via
+
+    def _try_clients(clients):
+        for client in clients:
+            try:
+                stream_url, title = _try_resolve(url, client, now)
+                return _ok(stream_url, title, f"ytdlp:{client}")
+            except Exception as e:
+                errs.append(f"{client}: {type(e).__name__}: {str(e)[:160]}")
+        return None
+
+    # 1) cookies configured -> yt-dlp is the reliable path, try it first
+    if _COOKIEFILE:
+        r = _try_clients(_PLAYER_CLIENTS)
+        if r:
+            return r
+    else:
+        # 2) no cookies -> quick cipher-relay attempt (single, short timeout)
         try:
-            stream_url, title = _try_resolve(url, client, now)
-            with _cache_lock:
-                _stream_cache[video_id] = (stream_url, title, now)
-            return stream_url, title
+            stream_url, title = _resolve_via_cipher(video_id, quick=True)
+            return _ok(stream_url, title, "cipher")
         except Exception as e:
-            tb = traceback.format_exc(limit=5).replace("\n", " | ")[:800]
-            errs.append(f"{client}: {type(e).__name__}: {str(e)[:160]} || TB: {tb}")
-            continue
-    # yt-dlp is bot-walled from this host -> fall back to Invidious proxies
+            errs.append(f"cipher: {type(e).__name__}: {str(e)[:160]}")
+        # 3) yt-dlp without cookies: only 2 least-walled clients, fail fast
+        r = _try_clients(["web_embedded", "android"])
+        if r:
+            return r
+    # 4) last resort: Invidious proxies
     inv = _try_invidious(video_id)
     if inv:
-        with _cache_lock:
-            _stream_cache[video_id] = (inv, None, now)
-        return inv, None
+        return _ok(inv, None, "invidious")
     raise DownloadError("all resolvers failed | " + " || ".join(errs))
 
 
@@ -369,11 +384,16 @@ def api_mood():
 
 @app.get("/api/song/<video_id>")
 def api_song(video_id):
-    """Metadata + playable stream URL for one song."""
+    """Metadata + playable stream URL for one song.
+
+    Query ?fresh=1 bypasses the stream-URL cache (used by the client's
+    retry path when a cached URL stopped playing).
+    """
     if _rate_limited(request.remote_addr or "unknown"):
         return jsonify({"error": "rate limited — slow down a bit"}), 429
     try:
-        stream_url, dl_title = resolve_stream(video_id)
+        stream_url, dl_title, via = resolve_stream(
+            video_id, fresh=request.args.get("fresh") == "1")
     except Exception as e:
         return jsonify({"error": f"stream failed: {e}"}), 502
     meta = {}
@@ -388,8 +408,44 @@ def api_song(video_id):
         }
     except Exception:
         meta = {"title": dl_title, "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"}
-    meta.update({"videoId": video_id, "stream_url": stream_url})
+    meta.update({"videoId": video_id, "stream_url": stream_url, "via": via})
     return jsonify(meta)
+
+
+@app.get("/api/diag")
+def api_diag():
+    """Diagnostics for the client's Settings screen (rate-limited).
+
+    Reports whether cookies are configured, whether the cipher relay is
+    alive, and runs one live resolve to show which resolver wins and how
+    long it takes. No secret values are ever returned.
+    """
+    if _rate_limited(request.remote_addr or "unknown"):
+        return jsonify({"error": "rate limited — slow down a bit"}), 429
+    out = {"cookies_configured": bool(_COOKIEFILE), "relay": {}, "resolve": {}}
+    relay = os.environ.get("YT_RELAY", "https://ytprobe.nctti.tech/resolve")
+    t0 = time.time()
+    try:
+        r = requests.get(f"{relay}?v=dQw4w9WgXcQ", timeout=30)
+        d = r.json() if r.status_code == 200 else {}
+        sd = d.get("streamingData") or {}
+        out["relay"] = {
+            "ok": bool(sd.get("adaptiveFormats") or sd.get("formats")),
+            "ms": int((time.time() - t0) * 1000),
+            "error": d.get("error"),
+        }
+    except Exception as e:
+        out["relay"] = {"ok": False, "ms": int((time.time() - t0) * 1000),
+                        "error": f"{type(e).__name__}: {str(e)[:120]}"}
+    t0 = time.time()
+    try:
+        _url, _title, via = resolve_stream("dQw4w9WgXcQ", fresh=True)
+        out["resolve"] = {"ok": True, "via": via,
+                          "ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        out["resolve"] = {"ok": False, "ms": int((time.time() - t0) * 1000),
+                          "error": str(e)[:300]}
+    return jsonify(out)
 
 
 @app.get("/api/queue/<video_id>")
@@ -562,15 +618,16 @@ def _js_runtimes_cfg():
     if os.path.isfile(_NODE_BIN) and os.access(_NODE_BIN, os.X_OK):
         return {"node": {"path": _NODE_BIN}}
     return {"node": {}}  # fall back to PATH lookup (local dev)
-def _resolve_via_cipher(video_id):
+def _resolve_via_cipher(video_id, quick=False):
     """Resolve a playable audio URL: ytmusicapi cipher + yt-dlp decipher."""
     song = None
     # streamingData must come from a clean IP. The Cloudflare relay
     # (free, our own worker) retries internally until YouTube answers.
     relay = os.environ.get("YT_RELAY", "https://ytprobe.nctti.tech/resolve")
-    for attempt in range(2):
+    attempts = 1 if quick else 2
+    for attempt in range(attempts):
         try:
-            r = requests.get(f"{relay}?v={video_id}", timeout=90)
+            r = requests.get(f"{relay}?v={video_id}", timeout=25 if quick else 90)
             if r.status_code == 200:
                 data = r.json()
                 sd = data.get("streamingData") or {}
