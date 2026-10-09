@@ -1,5 +1,5 @@
 /* Sur service worker — app-shell caching for installability & offline shell */
-const CACHE = 'sur-shell-v1';
+const CACHE = 'sur-shell-v2';
 const SHELL = [
   '/',
   '/index.html',
